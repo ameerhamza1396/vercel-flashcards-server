@@ -1,4 +1,4 @@
 Flask
-PyMuPDF==1.24.5 # fitz library
-google-generativeai==0.6.0 # Or your desired version
-python-dotenv # If you test locally and still use .env
+PyMuPDF
+google-generativeai==0.6.0
+python-dotenv
