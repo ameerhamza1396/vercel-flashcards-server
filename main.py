@@ -1,75 +1,104 @@
 import base64
-import io
-import csv
-import PyPDF2
-import requests
+import fitz
+import pandas as pd
+import json
 import os
-from flask import Flask, request, jsonify
+import time
+import itertools
+import re
+from pathlib import Path
+import google.generativeai as genai
+import tempfile
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler
+import traceback
+from io import BytesIO
 
-app = Flask(__name__)
+# Load env variables from Vercel's environment
+API_KEYS_STR = os.environ.get("GEMINI_API_KEYS", "")
+if not API_KEYS_STR:
+    raise ValueError("GEMINI_API_KEYS environment variable not set")
+API_KEYS = [key.strip() for key in API_KEYS_STR.split(',') if key.strip()]
+api_key_cycler = itertools.cycle(API_KEYS)
+current_api_key = next(api_key_cycler)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Your Gemini API key
+GEMINI_MODEL = 'gemini-2.5-flash'
 
-def extract_text_from_pdf(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
+def extract_text_from_pdf_bytes(pdf_bytes):
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-    return text.strip()
+    for page_num in range(len(document)):
+        page = document.load_page(page_num)
+        text += page.get_text()
+    document.close()
+    return text
 
-def call_gemini_api(prompt, instructions, text):
-    """
-    Calls Gemini API with the provided prompt, instructions, and text.
-    You can adjust this to fit your exact Gemini request structure.
-    """
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
+def call_gemini_api_for_extraction(text_chunk, prompt_text):
+    global current_api_key, api_key_cycler
+    prompt = f"{prompt_text}\n---\n{text_chunk}\n---"
 
-    payload = {
-        "contents": [{
-            "parts": [{"text": f"{prompt}\n\nInstructions: {instructions}\n\nText:\n{text}"}]
-        }]
-    }
+    for i in range(3):
+        try:
+            genai.configure(api_key=current_api_key)
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            response = model.generate_content(
+                contents=[{"role": "user", "parts": [{"text": prompt}]}]
+            )
+            raw_text = response.text.strip()
 
-    response = requests.post(url, headers=headers, params=params, json=payload)
-    response.raise_for_status()
-    data = response.json()
+            match = re.search(r'```json\s*(\[.*?\])\s*```', raw_text, re.DOTALL)
+            json_str = match.group(1) if match else raw_text
+            extracted_data = json.loads(json_str)
+            return extracted_data if isinstance(extracted_data, list) else []
+        except Exception as e:
+            current_api_key = next(api_key_cycler)
+            time.sleep(1)
+    return []
 
-    # Extract generated text
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+def process_text_in_chunks(full_text, prompt_text, chunk_size=3000):
+    all_data = []
+    for i in range(0, len(full_text), chunk_size):
+        chunk = full_text[i:i + chunk_size]
+        chunk_data = call_gemini_api_for_extraction(chunk, prompt_text)
+        all_data.extend(chunk_data)
+    return all_data
 
-def create_csv_base64(original_text, generated_text):
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Original Text", "Generated Text"])
-    writer.writerow([original_text, generated_text])
-    csv_bytes = output.getvalue().encode("utf-8")
-    return base64.b64encode(csv_bytes).decode("utf-8")
-
-@app.route("/process-pdf", methods=["POST"])
-def process_pdf():
+def handler(request):
     try:
-        data = request.get_json()
+        body = json.loads(request.rfile.read(int(request.headers['Content-Length'])))
+        pdf_base64 = body.get("pdfContent")
+        prompt_text = body.get("promptText", "Default prompt")
+        output_filename = body.get("outputFilename", f"flashcards_{int(time.time())}")
 
-        pdf_base64 = data.get("pdf_base64")
-        prompt = data.get("prompt", "")
-        instructions = data.get("instructions", "")
-
-        if not pdf_base64 or not prompt:
-            return jsonify({"error": "PDF and prompt are required"}), 400
+        if not pdf_base64:
+            return (400, {"error": "No PDF content provided"})
 
         pdf_bytes = base64.b64decode(pdf_base64)
-        pdf_file = io.BytesIO(pdf_bytes)
+        pdf_text = extract_text_from_pdf_bytes(pdf_bytes)
+        flashcards = process_text_in_chunks(pdf_text, prompt_text)
 
-        extracted_text = extract_text_from_pdf(pdf_file)
-        generated_text = call_gemini_api(prompt, instructions, extracted_text)
-        csv_base64 = create_csv_base64(extracted_text, generated_text)
+        # Save to CSV
+        temp_dir = tempfile.gettempdir()
+        csv_path = os.path.join(temp_dir, f"{output_filename}.csv")
+        pd.DataFrame(flashcards).to_csv(csv_path, index=False)
 
-        return jsonify({"csv_base64": csv_base64}), 200
+        # For now, return CSV content as base64 (can later switch to Supabase Storage)
+        with open(csv_path, "rb") as f:
+            csv_base64 = base64.b64encode(f.read()).decode()
+
+        return (200, {
+            "flashcardsCount": len(flashcards),
+            "fileName": f"{output_filename}.csv",
+            "fileContentBase64": csv_base64
+        })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        traceback.print_exc()
+        return (500, {"error": str(e)})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+# Vercel entrypoint
+def handler_main(request, response):
+    status, data = handler(request)
+    response.status_code = status
+    response.headers["Content-Type"] = "application/json"
+    response.write(json.dumps(data))
